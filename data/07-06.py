@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-D2.csv 후속 분석 2 - feature_7 스파이크, feature_9/8 severity 관계
-실행: python eda_D2_followup2.py (data/D2.csv 필요)
-결과: eda_outputs/ 에 15~17 이미지 저장
+D2.csv 후속 분석 5 - PCA를 이용한 차원 축소(20개 -> 2개)와 PC1/PC2 시계열 트레이스
+목적: feature 20개 + 심한 다중공선성 문제를, row-level PCA로 압축한 PC1/PC2 두 개만으로도
+      정상/이상을 여전히 잘 구분해낼 수 있는지 확인한다.
+실행: python eda_D2_followup5.py (data/D2.csv 필요)
+결과: eda_outputs/ 에 23~25 이미지 저장
 """
 import os, platform
 import numpy as np
@@ -10,7 +12,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import seaborn as sns
-from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import accuracy_score, f1_score
 
 OUT_DIR = 'eda_outputs'
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -40,79 +46,95 @@ def save(fig, name):
 
 df = pd.read_csv('data/D2.csv')
 feat_cols = [c for c in df.columns if c.startswith('feature_')]
-test_df = df[df['is_test'] == 1]
-y = test_df.groupby('MaterialID')['target'].first()
 
 # ---------------------------------------------------------
-# 15. feature_7 스파이크 분석
+# 1) row-level(시점 단위)로 20개 feature 원본 그대로 표준화 후 PCA
+#    - row-level을 쓰는 이유: PC1(t), PC2(t) "시계열 트레이스"를 그리려면
+#      각 시점(row)마다 주성분 점수가 있어야 하므로, 자재 단위로 미리 요약하면 안 됨
 # ---------------------------------------------------------
-agg_max = test_df.groupby('MaterialID')[feat_cols].max()
-idx = test_df.groupby('MaterialID')['feature_7'].idxmax()
-peak = df.loc[idx, ['MaterialID', 'duration_ms', 'feature_7']].set_index('MaterialID')
-peak['target'] = y
-
-TH = 3
-spike = (agg_max['feature_7'] > TH).astype(int)
-table = pd.crosstab(spike, y)
-chi2, p, dof, exp = stats.chi2_contingency(table)
-print('=== feature_7 스파이크(>%.0f) 발생 여부 vs target 카이제곱 검정 ===' % TH)
-print(table)
-print(f'chi2={chi2:.3f}, p-value={p:.6f}')
-print('정상 스파이크 비율:', (spike[y == 0]).mean())
-print('이상 스파이크 비율:', (spike[y == 1]).mean())
-
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-# (좌) 스파이크 발생 여부별 비율 막대그래프
-rates = pd.DataFrame({
-    'target': ['정상(0)', '이상(1)'],
-    'spike_rate': [(spike[y == 0]).mean(), (spike[y == 1]).mean()]
-})
-axes[0].bar(rates['target'], rates['spike_rate'], color=['#4C72B0', '#C44E52'])
-axes[0].set_ylabel('스파이크(feature_7 max>3) 발생 비율')
-axes[0].set_title(f'정상/이상별 스파이크 발생 비율 (카이제곱 p={p:.1e})')
-
-# (우) 스파이크 발생 시점 vs 크기 산점도
-spiked = peak[peak['feature_7'] > TH]
-for label, color, name in [(0, '#4C72B0', '정상'), (1, '#C44E52', '이상')]:
-    sub = spiked[spiked.target == label]
-    axes[1].scatter(sub['duration_ms'], sub['feature_7'], c=color, label=name, alpha=0.7)
-axes[1].set_xlabel('스파이크 발생 시점 (duration_ms)')
-axes[1].set_ylabel('스파이크 크기 (feature_7 max)')
-axes[1].set_title('스파이크 발생 시점 vs 크기')
-axes[1].legend()
-save(fig, '15_feature7_spike_analysis.png')
+scaler = StandardScaler()
+X = scaler.fit_transform(df[feat_cols])
+pca_full = PCA(n_components=20, random_state=42)
+pca_full.fit(X)
 
 # ---------------------------------------------------------
-# 16. feature_9 / feature_8 severity 관계
+# 2) 몇 개의 주성분을 쓸지 결정 (scree plot)
 # ---------------------------------------------------------
-agg_mean = test_df.groupby('MaterialID')[feat_cols].mean()
-sub = agg_mean.loc[y == 1, ['feature_8', 'feature_9']].copy()
-sub['f9_level'] = pd.cut(sub['feature_9'], bins=[-40, -28, -22, -16, -8],
-                          labels=['A(-28~-40,심각)', 'B(-22~-28)', 'C(-16~-22)', 'D(-8~-16,경미)'])
-
-level_summary = sub.groupby('f9_level')[['feature_8', 'feature_9']].agg(['mean', 'count'])
-print('\n=== feature_9 레벨 구간별 feature_8 관계 ===')
-print(level_summary)
-
-fig, ax = plt.subplots(figsize=(8, 7))
-palette = {'A(-28~-40,심각)': '#8B0000', 'B(-22~-28)': '#C44E52',
-           'C(-16~-22)': '#DD8452', 'D(-8~-16,경미)': '#4C72B0'}
-for lvl, color in palette.items():
-    s = sub[sub.f9_level == lvl]
-    ax.scatter(s['feature_9'], s['feature_8'], c=color, label=f'{lvl} (n={len(s)})', alpha=0.7)
-ax.set_xlabel('feature_9 (자재 단위 평균)')
-ax.set_ylabel('feature_8 (자재 단위 평균)')
-ax.set_title('이상 자재 내 feature_8 vs feature_9 — 연속적 severity 관계 확인')
+ratio = pca_full.explained_variance_ratio_
+cum = np.cumsum(ratio)
+fig, ax = plt.subplots(figsize=(9, 5.5))
+x = np.arange(1, 21)
+ax.bar(x, ratio, color='#4C72B0', label='개별 설명분산')
+ax.plot(x, cum, color='#C44E52', marker='o', markersize=4, label='누적 설명분산')
+ax.axhline(0.8, color='gray', linestyle='--', linewidth=1)
+ax.axvline(2.5, color='black', linestyle=':', linewidth=1)
+ax.set_xlabel('주성분 번호')
+ax.set_ylabel('설명분산 비율')
+ax.set_title('20개 feature 전체 PCA — 주성분별/누적 설명분산 (row-level)')
+ax.set_xticks(x)
 ax.legend()
-save(fig, '16_feature9_severity_scatter.png')
+save(fig, '23_pca_scree_20features.png')
+print('PC1:', ratio[0], 'PC1+PC2:', cum[1], 'PC1~5 누적:', cum[4])
 
-# 레벨별 다른 dynamic 변수(feature_14)도 같이 severity에 따라 변하는지 확인
-sub2 = agg_mean.loc[y == 1, ['feature_14']].copy()
-sub2['f9_level'] = sub['f9_level']
-fig, ax = plt.subplots(figsize=(8, 5))
-sns.boxplot(data=sub2, x='f9_level', y='feature_14', ax=ax,
-            order=['A(-28~-40,심각)', 'B(-22~-28)', 'C(-16~-22)', 'D(-8~-16,경미)'])
-ax.set_title('severity 레벨별 feature_14(dynamic 대표변수) 분포')
-save(fig, '17_severity_vs_feature14.png')
+# ---------------------------------------------------------
+# 3) PC1, PC2 두 개만 선택해서 재적합 + 로딩(기여도) 확인
+# ---------------------------------------------------------
+pca2 = PCA(n_components=2, random_state=42)
+pcs = pca2.fit_transform(X)
+df['PC1'] = pcs[:, 0]
+df['PC2'] = pcs[:, 1]
 
-print('\n모든 후속 분석2 완료 ->', os.path.abspath(OUT_DIR))
+loadings = pd.DataFrame(pca2.components_.T, index=feat_cols, columns=['PC1', 'PC2'])
+print('\n=== PC1 기여도 상위 5개 ===')
+print(loadings['PC1'].abs().sort_values(ascending=False).head(5))
+print('\n=== PC2 기여도 상위 5개 ===')
+print(loadings['PC2'].abs().sort_values(ascending=False).head(5))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+for ax, pc in zip(axes, ['PC1', 'PC2']):
+    top = loadings[pc].sort_values(key=np.abs, ascending=True).tail(10)
+    colors = ['#C44E52' if v > 0 else '#4C72B0' for v in top.values]
+    ax.barh(top.index, top.values, color=colors)
+    ax.set_title(f'{pc} 로딩 (기여도) 상위 10개 feature')
+    ax.axvline(0, color='k', linewidth=0.8)
+save(fig, '24_pc_loadings.png')
+
+# ---------------------------------------------------------
+# 4) PC1(t), PC2(t) 시계열 트레이스 (정상 3개 vs 이상 3개 자재)
+# ---------------------------------------------------------
+test_df = df[df.is_test == 1]
+mat_label = test_df.groupby('MaterialID')['target'].first()
+normal_ids = mat_label[mat_label == 0].sample(3, random_state=42).index.tolist()
+abn_ids = mat_label[mat_label == 1].sample(3, random_state=42).index.tolist()
+
+fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+for ax, pc in zip(axes, ['PC1', 'PC2']):
+    for mid in normal_ids:
+        sub = df[df.MaterialID == mid].sort_values('duration_ms')
+        ax.plot(sub['duration_ms'], sub[pc], color='#4C72B0', alpha=0.7, label='정상' if mid == normal_ids[0] else None)
+    for mid in abn_ids:
+        sub = df[df.MaterialID == mid].sort_values('duration_ms')
+        ax.plot(sub['duration_ms'], sub[pc], color='#C44E52', alpha=0.7, label='이상' if mid == abn_ids[0] else None)
+    ax.axvline(0.6, color='gray', linestyle='--', linewidth=1, label='Step 경계(대략)' if pc == 'PC1' else None)
+    ax.set_ylabel(pc)
+    ax.set_title(f'{pc} 시계열 트레이스 (정상 3개 vs 이상 3개 자재)')
+    ax.legend()
+axes[-1].set_xlabel('duration_ms (정규화 시간)')
+save(fig, '25_pc_timeseries_trace.png')
+
+# ---------------------------------------------------------
+# 5) 자재 단위 PC1/PC2 평균으로 target 분리력 및 분류 성능 확인
+# ---------------------------------------------------------
+agg = test_df.groupby('MaterialID')[['PC1', 'PC2']].mean()
+y = test_df.groupby('MaterialID')['target'].first()
+print('\nPC1_mean vs target 상관:', agg['PC1'].corr(y))
+print('PC2_mean vs target 상관:', agg['PC2'].corr(y))
+print('정상 PC2 범위:', agg['PC2'][y == 0].min(), '~', agg['PC2'][y == 0].max())
+print('이상 PC2 범위:', agg['PC2'][y == 1].min(), '~', agg['PC2'][y == 1].max())
+
+clf = LogisticRegression(max_iter=2000)
+pred = cross_val_predict(clf, agg[['PC1', 'PC2']], y, cv=StratifiedKFold(5, shuffle=True, random_state=42))
+acc, f1 = accuracy_score(y, pred), f1_score(y, pred)
+print(f'\nPC1+PC2 로지스틱회귀 (5-fold CV): accuracy={acc:.4f}, f1={f1:.4f}')
+
+print('\n모든 후속 분석5 완료 ->', os.path.abspath(OUT_DIR))
